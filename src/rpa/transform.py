@@ -9,6 +9,10 @@ import numpy as np
 from loguru import logger
 from ultralytics import YOLO
 
+# YOLO pose keypoint indices
+LEFT_ANKLE_IDX = 13
+RIGHT_ANKLE_IDX = 14
+
 
 class VideoTransformer:
     """Transform video to crop runner's feet with minimal background."""
@@ -87,8 +91,8 @@ class VideoTransformer:
 
         # Extract ankle/foot keypoints (indices 13-16)
         # 13: left_ankle, 14: right_ankle
-        left_ankle = keypoints[13] if len(keypoints) > 13 else None
-        right_ankle = keypoints[14] if len(keypoints) > 14 else None
+        left_ankle = keypoints[LEFT_ANKLE_IDX] if len(keypoints) > LEFT_ANKLE_IDX else None
+        right_ankle = keypoints[RIGHT_ANKLE_IDX] if len(keypoints) > RIGHT_ANKLE_IDX else None
 
         # Filter valid keypoints (confidence > 0)
         valid_points = []
@@ -109,7 +113,6 @@ class VideoTransformer:
             min_x = int(points_array[:, 0].min())
             max_x = int(points_array[:, 0].max())
             min_y = int(points_array[:, 1].min())
-            max_y = int(points_array[:, 1].max())
 
             # Add margin around keypoints (ankles to ground)
             feet_width = max(max_x - min_x, 50)  # Minimum 50px width
@@ -280,7 +283,7 @@ class VideoTransformer:
         detection_result = self.detect_runner_feet(frame)
 
         if detection_result is not None:
-            body_bbox, feet_bbox = detection_result
+            _body_bbox, feet_bbox = detection_result
             fx1, fy1, fx2, fy2 = feet_bbox
             return ((fx1 + fx2) / 2, (fy1 + fy2) / 2, detection_result)
 
@@ -290,6 +293,56 @@ class VideoTransformer:
 
         logger.warning("No feet detection in frame {n}, using frame bottom center", n=frame_count)
         return (frame_width / 2, frame_height * 0.85, None)
+
+    def _calculate_feet_crop(
+        self, feet_bbox: tuple[int, int, int, int], frame_width: int, frame_height: int
+    ) -> tuple[int, int, int, int]:
+        """Calculate crop region from feet bbox with padding and aspect ratio preservation.
+
+        Args:
+            feet_bbox: Feet bounding box (x1, y1, x2, y2)
+            frame_width: Frame width
+            frame_height: Frame height
+
+        Returns:
+            Crop region (x1, y1, x2, y2)
+        """
+        fx1, fy1, fx2, fy2 = feet_bbox
+
+        # Calculate feet bbox dimensions
+        feet_width = fx2 - fx1
+        feet_height = fy2 - fy1
+        feet_center_x = (fx1 + fx2) / 2
+        feet_center_y = (fy1 + fy2) / 2
+
+        # Add padding around feet bbox
+        padded_width = int(feet_width * self.padding_scale)
+        padded_height = int(feet_height * self.padding_scale)
+
+        # Maintain aspect ratio of output
+        target_aspect = self.crop_width / self.crop_height
+        current_aspect = padded_width / padded_height
+
+        if current_aspect > target_aspect:
+            # Wider than target, adjust height
+            padded_height = int(padded_width / target_aspect)
+        else:
+            # Taller than target, adjust width
+            padded_width = int(padded_height * target_aspect)
+
+        # Calculate crop coordinates centered on feet
+        x1 = int(feet_center_x - padded_width / 2)
+        y1 = int(feet_center_y - padded_height / 2)
+        x2 = int(feet_center_x + padded_width / 2)
+        y2 = int(feet_center_y + padded_height / 2)
+
+        # Clamp to frame boundaries
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(frame_width, x2)
+        y2 = min(frame_height, y2)
+
+        return x1, y1, x2, y2
 
     def process_video(self) -> None:
         """Process video and create cropped output."""
@@ -318,42 +371,8 @@ class VideoTransformer:
 
                 # Calculate crop region based on feet bbox with padding
                 if bboxes is not None:
-                    body_bbox, feet_bbox = bboxes
-                    fx1, fy1, fx2, fy2 = feet_bbox
-
-                    # Calculate feet bbox dimensions
-                    feet_width = fx2 - fx1
-                    feet_height = fy2 - fy1
-                    feet_center_x = (fx1 + fx2) / 2
-                    feet_center_y = (fy1 + fy2) / 2
-
-                    # Add padding around feet bbox
-                    padded_width = int(feet_width * self.padding_scale)
-                    padded_height = int(feet_height * self.padding_scale)
-
-                    # Maintain aspect ratio of output
-                    target_aspect = self.crop_width / self.crop_height
-                    current_aspect = padded_width / padded_height
-
-                    if current_aspect > target_aspect:
-                        # Wider than target, adjust height
-                        padded_height = int(padded_width / target_aspect)
-                    else:
-                        # Taller than target, adjust width
-                        padded_width = int(padded_height * target_aspect)
-
-                    # Calculate crop coordinates centered on feet
-                    x1 = int(feet_center_x - padded_width / 2)
-                    y1 = int(feet_center_y - padded_height / 2)
-                    x2 = int(feet_center_x + padded_width / 2)
-                    y2 = int(feet_center_y + padded_height / 2)
-
-                    # Clamp to frame boundaries
-                    x1 = max(0, x1)
-                    y1 = max(0, y1)
-                    x2 = min(frame_width, x2)
-                    y2 = min(frame_height, y2)
-
+                    _body_bbox, feet_bbox = bboxes
+                    x1, y1, x2, y2 = self._calculate_feet_crop(feet_bbox, frame_width, frame_height)
                 else:
                     # No detection, use previous smooth center
                     smooth_x, smooth_y = self.smooth_center_position((center_x, center_y))
