@@ -2,6 +2,70 @@
 
 This module processes videos containing multiple runners and generates separate
 cropped output videos for each unique runner, focusing specifically on their feet.
+Uses YOLOv8-Pose for person detection/tracking and extracts stabilized foot crops.
+
+Usage:
+    uv run python -m rpa.process_runners --input VIDEO --output-dir DIR [OPTIONS]
+
+CLI Options:
+    --input PATH              (required) Path to input video file
+    --output-dir PATH         (required) Directory for output videos
+
+    Dynamic ROI Sizing:
+    --roi-height-ratio FLOAT  Crop size as % of person's bbox height (default: 0.40)
+                              Larger values = bigger crops, smaller = tighter on feet
+    --min-roi-size INT        Minimum crop size in pixels (default: 128)
+                              Prevents uselessly small crops for distant runners
+
+    Vertical Positioning:
+    --ankle-vertical-ratio FLOAT  Where ankles appear in crop, 0=top, 1=bottom (default: 0.35)
+                                  Lower values leave more room below ankles for feet visibility
+    --max-padding-ratio FLOAT     Skip frames with more than this ratio of black padding (default: 0.25)
+                                  Filters out frames where feet have left the video frame
+
+    Output:
+    --output-size INT         Final output video size in pixels (default: 224)
+                              Output is always square (e.g., 224x224)
+
+    Track Filtering:
+    --min-frames INT          Minimum frames to keep a track (default: 20)
+                              Filters out ghost tracks / brief detections
+    --conf-threshold FLOAT    YOLO detection confidence threshold (default: 0.25)
+
+    Smoothing:
+    --smoothing-window INT    Window size for center position smoothing (default: 5)
+    --height-smoothing-window INT  Window size for height/zoom smoothing (default: 15)
+                                   Larger window prevents zoom pulsing
+
+    Temporal Slicing (for VideoMAE training):
+    --slice-len INT           Frames per training clip (default: 32)
+    --stride INT              Sliding window stride between clips (default: 16)
+                              Creates 50% overlap with default settings
+
+    Debug:
+    --visualize               Show real-time visualization during processing
+
+Examples:
+    # Basic usage with defaults
+    uv run python -m rpa.process_runners \\
+        --input /path/to/video.mp4 \\
+        --output-dir /path/to/output
+
+    # Tighter crops with more feet visibility
+    uv run python -m rpa.process_runners \\
+        --input video.mp4 --output-dir out/ \\
+        --roi-height-ratio 0.35 --ankle-vertical-ratio 0.30
+
+    # Stricter frame filtering (skip if >15% padding)
+    uv run python -m rpa.process_runners \\
+        --input video.mp4 --output-dir out/ \\
+        --max-padding-ratio 0.15
+
+Output Structure:
+    output-dir/
+    ├── {input_stem}_ID_{track_id}.mp4    # Full stabilized video per runner
+    └── clips/
+        └── {input_stem}_ID_{track_id}_clip_{NNN}.mp4  # Training clips
 """
 
 import argparse
@@ -44,6 +108,10 @@ class PreprocessorConfig:
     # Vertical positioning: where ankles should appear in the crop (0=top, 1=bottom)
     # Default 0.35 means ankles at 35% from top, leaving 65% below for feet visibility
     ankle_vertical_ratio: float = 0.35
+
+    # Maximum allowed padding ratio - skip frames where feet are out of bounds
+    # If more than this fraction of the crop would be black padding, skip the frame
+    max_padding_ratio: float = 0.25
 
     output_size: int = 224
     min_track_frames: int = 20
@@ -106,6 +174,7 @@ class VideoPreprocessor:
         self.roi_height_ratio = self.config.roi_height_ratio
         self.min_roi_size = self.config.min_roi_size
         self.ankle_vertical_ratio = self.config.ankle_vertical_ratio
+        self.max_padding_ratio = self.config.max_padding_ratio
         self.output_size = self.config.output_size
         self.min_track_frames = self.config.min_track_frames
         self.smoothing_window = self.config.smoothing_window
@@ -556,6 +625,41 @@ class VideoPreprocessor:
 
         return canvas
 
+    def _is_crop_valid(self, bounds: tuple[int, int, int, int], roi_size: int) -> bool:
+        """Check if a crop has acceptable amount of padding (feet in frame).
+
+        Skips frames where too much of the crop would be black padding,
+        indicating the feet have left the frame.
+
+        Args:
+            bounds: (x1, y1, x2, y2) ROI bounds
+            roi_size: Size of the square crop
+
+        Returns:
+            True if crop is valid (acceptable padding), False if should skip
+        """
+        x1, y1, x2, y2 = bounds
+
+        # Calculate how much of the ROI is out of bounds
+        # We care most about bottom padding (feet exiting frame bottom)
+        bottom_overflow = max(0, y2 - self.frame_height)
+        top_overflow = max(0, -y1)
+        left_overflow = max(0, -x1)
+        right_overflow = max(0, x2 - self.frame_width)
+
+        total_overflow_area = (
+            bottom_overflow * roi_size  # Bottom strip
+            + top_overflow * roi_size  # Top strip
+            + left_overflow * roi_size  # Left strip
+            + right_overflow * roi_size  # Right strip
+        )
+
+        # Avoid double-counting corners (approximate)
+        total_area = roi_size * roi_size
+        padding_ratio = total_overflow_area / total_area
+
+        return padding_ratio <= self.max_padding_ratio
+
     def generate_output_videos(
         self, tracks: dict[int, list[FrameData]]
     ) -> dict[int, Path]:
@@ -674,6 +778,8 @@ class VideoPreprocessor:
         frame_idx = 0
         frames_written = 0
 
+        frames_skipped = 0
+
         try:
             while True:
                 ret, frame = cap.read()
@@ -686,6 +792,13 @@ class VideoPreprocessor:
 
                     # Step 6: Use dynamic ROI size and adjusted center for this frame
                     bounds = self._get_roi_bounds(center, roi_size)
+
+                    # Step 7: Skip frames where feet are out of bounds (too much padding)
+                    if not self._is_crop_valid(bounds, roi_size):
+                        frames_skipped += 1
+                        frame_idx += 1
+                        continue
+
                     crop = self.extract_crop_with_padding(frame, bounds, roi_size)
 
                     # Resize to output size (224x224)
@@ -706,6 +819,13 @@ class VideoPreprocessor:
         finally:
             cap.release()
             out.release()
+
+        if frames_skipped > 0:
+            logger.debug(
+                "Track {id}: skipped {skipped} frames (feet out of bounds)",
+                id=track_id,
+                skipped=frames_skipped,
+            )
 
         logger.info(
             "Generated {path} with {n} frames",
@@ -987,6 +1107,12 @@ def parse_args() -> argparse.Namespace:
         help="Vertical position of ankles in crop (0=top, 1=bottom, default: 0.35 for feet visibility)",
     )
     parser.add_argument(
+        "--max-padding-ratio",
+        type=float,
+        default=0.25,
+        help="Skip frames with more than this ratio of black padding (default: 0.25)",
+    )
+    parser.add_argument(
         "--output-size",
         type=int,
         default=224,
@@ -1060,6 +1186,7 @@ def main() -> None:
         roi_height_ratio=args.roi_height_ratio,
         min_roi_size=args.min_roi_size,
         ankle_vertical_ratio=args.ankle_vertical_ratio,
+        max_padding_ratio=args.max_padding_ratio,
         output_size=args.output_size,
         min_track_frames=args.min_frames,
         smoothing_window=args.smoothing_window,
