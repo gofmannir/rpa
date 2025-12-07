@@ -4,6 +4,8 @@ This module processes videos containing multiple runners and generates separate
 cropped output videos for each unique runner, focusing specifically on their feet.
 Uses YOLOv8-Pose for person detection/tracking and extracts stabilized foot crops.
 
+Supports both FRONTAL and LATERAL (side) views with stride-aware ROI sizing.
+
 Usage:
     uv run python -m rpa.process_runners --input VIDEO --output-dir DIR [OPTIONS]
 
@@ -11,15 +13,25 @@ CLI Options:
     --input PATH              (required) Path to input video file
     --output-dir PATH         (required) Directory for output videos
 
-    Dynamic ROI Sizing:
+    Dynamic ROI Sizing (Stride-Aware):
     --roi-height-ratio FLOAT  Crop size as % of person's bbox height (default: 0.40)
-                              Larger values = bigger crops, smaller = tighter on feet
+                              Used for frontal views / distance-based zoom
+    --foot-length-ratio FLOAT Foot length as fraction of body height (default: 0.15)
+                              Used for geometry-based stride calculation
     --min-roi-size INT        Minimum crop size in pixels (default: 128)
                               Prevents uselessly small crops for distant runners
 
+    The final ROI size = max(height_based, stride_based, min_roi_size)
+    - height_based = bbox_height * roi_height_ratio
+    - stride_based = ankle_distance + 2 * bbox_height * foot_length_ratio
+    - Frontal view: height-based dominates (ankles close together)
+    - Lateral view: stride-based dominates (ankles far apart)
+
     Vertical Positioning:
     --ankle-vertical-ratio FLOAT  Where ankles appear in crop, 0=top, 1=bottom (default: 0.35)
-                                  Lower values leave more room below ankles for feet visibility
+                                  Lower values leave more room below ankles for feet
+    --side-view-y-offset-ratio FLOAT  Additional downward shift for ground contact (default: 0.1)
+                                      Helps keep ground contact visible in side views
     --max-padding-ratio FLOAT     Skip frames with more than this ratio of black padding (default: 0.25)
                                   Filters out frames where feet have left the video frame
 
@@ -34,8 +46,8 @@ CLI Options:
 
     Smoothing:
     --smoothing-window INT    Window size for center position smoothing (default: 5)
-    --height-smoothing-window INT  Window size for height/zoom smoothing (default: 15)
-                                   Larger window prevents zoom pulsing
+    --height-smoothing-window INT  Window size for ROI size smoothing (default: 15)
+                                   Critical for stride-aware sizing to prevent zoom pumping
 
     Temporal Slicing (for VideoMAE training):
     --slice-len INT           Frames per training clip (default: 32)
@@ -46,20 +58,20 @@ CLI Options:
     --visualize               Show real-time visualization during processing
 
 Examples:
-    # Basic usage with defaults
+    # Basic usage with defaults (works for both frontal and lateral views)
     uv run python -m rpa.process_runners \\
         --input /path/to/video.mp4 \\
         --output-dir /path/to/output
 
-    # Tighter crops with more feet visibility
+    # Adjust foot size estimation (larger feet / more padding)
     uv run python -m rpa.process_runners \\
         --input video.mp4 --output-dir out/ \\
-        --roi-height-ratio 0.35 --ankle-vertical-ratio 0.30
+        --foot-length-ratio 0.18 --side-view-y-offset-ratio 0.15
 
-    # Stricter frame filtering (skip if >15% padding)
+    # Tighter crops for frontal view
     uv run python -m rpa.process_runners \\
-        --input video.mp4 --output-dir out/ \\
-        --max-padding-ratio 0.15
+        --input frontal.mp4 --output-dir out/ \\
+        --roi-height-ratio 0.35 --ankle-vertical-ratio 0.30
 
 Output Structure:
     output-dir/
@@ -69,7 +81,9 @@ Output Structure:
 """
 
 import argparse
+import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -105,6 +119,12 @@ class PreprocessorConfig:
     roi_height_ratio: float = 0.40  # Crop size as percentage of person's bbox height
     min_roi_size: int = 128  # Minimum crop size to prevent uselessly small crops
 
+    # Stride-aware ROI sizing (for side/lateral views)
+    # When runner's stride is wide, expand crop to keep both feet in frame
+    # Uses body geometry: foot length ≈ 15% of body height
+    foot_length_ratio: float = 0.15  # Foot length as fraction of body height
+    side_view_y_offset_ratio: float = 0.1  # Push crop down slightly for ground contact
+
     # Vertical positioning: where ankles should appear in the crop (0=top, 1=bottom)
     # Default 0.35 means ankles at 35% from top, leaving 65% below for feet visibility
     ankle_vertical_ratio: float = 0.35
@@ -116,13 +136,18 @@ class PreprocessorConfig:
     output_size: int = 224
     min_track_frames: int = 20
     smoothing_window: int = 5  # For center position smoothing
-    height_smoothing_window: int = 15  # Larger window for height to prevent zoom pulsing
+    height_smoothing_window: int = 15  # Larger window for ROI size to prevent zoom pulsing
     conf_threshold: float = 0.25
     visualize: bool = False
 
     # Phase 4: Temporal slicing for VideoMAE Transformer
-    slice_len: int = 32  # Number of frames per training clip
+    slice_len: int = 16  # Number of frames per training clip
     stride: int = 16  # Step size between slices (overlap = slice_len - stride)
+
+    # Video quality settings
+    # CRF (Constant Rate Factor) for H.264 encoding: 0=lossless, 17=visually lossless, 23=default
+    # Lower = better quality, larger files. Recommended: 0-17 for training data
+    video_crf: int = 0  # 0 = lossless H.264
 
 
 class VideoPreprocessor:
@@ -173,6 +198,8 @@ class VideoPreprocessor:
         # Unpack config for convenience
         self.roi_height_ratio = self.config.roi_height_ratio
         self.min_roi_size = self.config.min_roi_size
+        self.foot_length_ratio = self.config.foot_length_ratio
+        self.side_view_y_offset_ratio = self.config.side_view_y_offset_ratio
         self.ankle_vertical_ratio = self.config.ankle_vertical_ratio
         self.max_padding_ratio = self.config.max_padding_ratio
         self.output_size = self.config.output_size
@@ -183,6 +210,7 @@ class VideoPreprocessor:
         self.visualize = self.config.visualize
         self.slice_len = self.config.slice_len
         self.stride = self.config.stride
+        self.video_crf = self.config.video_crf
 
         self.model: YOLO | None = None
         self.fps: int = 30
@@ -660,6 +688,72 @@ class VideoPreprocessor:
 
         return padding_ratio <= self.max_padding_ratio
 
+    def _encode_video_ffmpeg(
+        self,
+        frames: list[np.ndarray],
+        output_path: Path,
+        fps: float,
+    ) -> bool:
+        """Encode frames to video using FFmpeg with high quality settings.
+
+        Uses H.264 with configurable CRF (Constant Rate Factor):
+        - CRF 0: Lossless (large files, perfect quality)
+        - CRF 17: Visually lossless (smaller files, imperceptible loss)
+        - CRF 23: Default (good balance)
+
+        Args:
+            frames: List of frames (numpy arrays in BGR format)
+            output_path: Path to output video file
+            fps: Frames per second
+
+        Returns:
+            True if encoding succeeded, False otherwise
+        """
+        if not frames:
+            return False
+
+        # Use a temporary directory for frame images
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+
+            # Write frames as temporary PNG files (lossless intermediate)
+            for i, frame in enumerate(frames):
+                frame_path = tmp_path / f"frame_{i:06d}.png"
+                cv2.imwrite(str(frame_path), frame)
+
+            # FFmpeg command for high-quality H.264 encoding
+            cmd = [
+                "ffmpeg",
+                "-y",  # Overwrite output
+                "-framerate", str(fps),
+                "-i", str(tmp_path / "frame_%06d.png"),
+                "-c:v", "libx264",
+                "-crf", str(self.video_crf),
+                "-preset", "slow",  # Better compression
+                "-pix_fmt", "yuv420p",  # Compatibility
+                "-movflags", "+faststart",  # Web streaming
+                str(output_path),
+            ]
+
+            try:
+                subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+            except subprocess.CalledProcessError as e:
+                logger.warning(
+                    "FFmpeg encoding failed: {err}, falling back to OpenCV",
+                    err=e.stderr[:200] if e.stderr else str(e),
+                )
+                return False
+            except FileNotFoundError:
+                logger.warning("FFmpeg not found, falling back to OpenCV")
+                return False
+
+        return True
+
     def generate_output_videos(
         self, tracks: dict[int, list[FrameData]]
     ) -> dict[int, Path]:
@@ -689,22 +783,82 @@ class VideoPreprocessor:
 
         return generated_videos
 
+    def _calculate_stride_aware_roi(
+        self, frame_data_list: list[FrameData]
+    ) -> tuple[list[int], list[tuple[float, float]], int]:
+        """Calculate stride-aware ROI sizes and adjusted centers.
+
+        For frontal views: ROI is based on bbox height (runner distance from camera)
+        For lateral/side views: ROI expands to encompass stride width (feet spread)
+
+        Args:
+            frame_data_list: List of frame data for this track
+
+        Returns:
+            Tuple of (roi_sizes, adjusted_centers, stride_dominant_count)
+        """
+        # === CENTER PROCESSING ===
+        raw_centers = [self._calculate_crop_center(fd) for fd in frame_data_list]
+        centers = self._interpolate_missing_centers(raw_centers)
+        smoothed_centers = self.smooth_positions(centers)
+
+        # === STRIDE-AWARE ROI SIZE CALCULATION ===
+        # Step 1: Calculate height-based sizes (for frontal views / distance)
+        raw_heights = [fd.bbox_height for fd in frame_data_list]
+        interpolated_heights = self._interpolate_heights(raw_heights)
+        smoothed_heights = self._smooth_heights(interpolated_heights)
+        height_based_sizes = [h * self.roi_height_ratio for h in smoothed_heights]
+
+        # Step 2: Calculate stride-based sizes (for lateral/side views)
+        # Uses body geometry: stride_size = ankle_distance + 2 * foot_length
+        # where foot_length ≈ bbox_height * foot_length_ratio (typically 15%)
+        raw_stride_widths = [
+            abs(fd.left_ankle[0] - fd.right_ankle[0])
+            if fd.left_ankle is not None and fd.right_ankle is not None
+            else 0.0
+            for fd in frame_data_list
+        ]
+
+        # Interpolate and smooth stride values
+        interpolated_strides = self._interpolate_heights(raw_stride_widths)
+        smoothed_strides = self._smooth_heights(interpolated_strides)
+
+        # Geometry-based stride size: ankle_dist + 2 * foot_length
+        # This automatically adapts to runner size and stride width
+        stride_based_sizes = [
+            stride + 2 * height * self.foot_length_ratio
+            for stride, height in zip(smoothed_strides, smoothed_heights, strict=True)
+        ]
+
+        # Step 3: Final ROI size = max(height_based, stride_based, min_roi_size)
+        raw_roi_sizes = [
+            max(height_based, stride_based, self.min_roi_size)
+            for height_based, stride_based in zip(height_based_sizes, stride_based_sizes, strict=True)
+        ]
+
+        # Step 4: Apply additional smoothing to final ROI sizes
+        roi_sizes = [int(s) for s in self._smooth_heights(raw_roi_sizes)]
+
+        # Count stride-dominant frames for logging
+        stride_dominant_count = sum(
+            1 for hb, sb in zip(height_based_sizes, stride_based_sizes, strict=True)
+            if sb > hb and sb > self.min_roi_size
+        )
+
+        # Step 5: Apply vertical offsets
+        adjusted_centers = []
+        for center, roi_size in zip(smoothed_centers, roi_sizes, strict=True):
+            vertical_offset = (0.5 - self.ankle_vertical_ratio) * roi_size
+            side_view_offset = roi_size * self.side_view_y_offset_ratio
+            adjusted_y = center[1] - vertical_offset + side_view_offset
+            adjusted_centers.append((center[0], adjusted_y))
+
+        return roi_sizes, adjusted_centers, stride_dominant_count
+
     def _generate_single_track_video(
         self, track_id: int, frame_data_list: list[FrameData]
     ) -> Path | None:
-        """Generate output video for a single track with dynamic ROI sizing.
-
-        DYNAMIC ROI SIZING LOGIC:
-        -------------------------
-        1. Extract bbox_height sequence from frame_data_list
-        2. Interpolate gaps in height values (same as center interpolation)
-        3. Apply smoothing with larger window (15 frames) to prevent zoom pulsing
-        4. Calculate per-frame ROI size: max(height * roi_height_ratio, min_roi_size)
-        5. Apply vertical offset so ankles appear at ankle_vertical_ratio from top
-           (ensures feet are visible when runners are close to camera)
-        6. Use dynamic ROI size for cropping each frame
-
-        This ensures consistent relative foot size regardless of runner distance.
+        """Generate output video for a single track with stride-aware dynamic ROI sizing.
 
         Args:
             track_id: Track identifier
@@ -713,35 +867,10 @@ class VideoPreprocessor:
         Returns:
             Path to generated video, or None if generation failed
         """
-        # === CENTER PROCESSING (existing logic) ===
-        raw_centers = [self._calculate_crop_center(fd) for fd in frame_data_list]
-        centers = self._interpolate_missing_centers(raw_centers)
-        smoothed_centers = self.smooth_positions(centers)
-
-        # === HEIGHT PROCESSING (new for dynamic ROI) ===
-        # Step 1: Extract raw bbox heights
-        raw_heights = [fd.bbox_height for fd in frame_data_list]
-
-        # Step 2: Interpolate missing/zero heights
-        interpolated_heights = self._interpolate_heights(raw_heights)
-
-        # Step 3: Smooth heights with larger window to prevent zoom pulsing
-        smoothed_heights = self._smooth_heights(interpolated_heights)
-
-        # Step 4: Calculate dynamic ROI size for each frame
-        roi_sizes = [
-            max(int(h * self.roi_height_ratio), self.min_roi_size)
-            for h in smoothed_heights
-        ]
-
-        # Step 5: Apply vertical offset to ensure feet are visible
-        # Shift crop center UP so ankles appear at ankle_vertical_ratio from top
-        # e.g., ankle_vertical_ratio=0.35 -> shift up by 0.15 * roi_size
-        adjusted_centers = []
-        for center, roi_size in zip(smoothed_centers, roi_sizes, strict=True):
-            offset = (0.5 - self.ankle_vertical_ratio) * roi_size
-            adjusted_y = center[1] - offset  # Shift UP (decrease y in image coords)
-            adjusted_centers.append((center[0], adjusted_y))
+        # Calculate stride-aware ROI sizes and adjusted centers
+        roi_sizes, adjusted_centers, stride_dominant_count = self._calculate_stride_aware_roi(
+            frame_data_list
+        )
 
         # Create frame index mappings
         frame_to_center = {
@@ -756,29 +885,25 @@ class VideoPreprocessor:
         # Log ROI size statistics for debugging
         if roi_sizes:
             logger.debug(
-                "Track {id} ROI sizes: min={min}, max={max}, avg={avg:.1f}",
+                "Track {id} ROI: min={min}, max={max}, avg={avg:.1f}, stride-dominant={sd}/{total}",
                 id=track_id,
                 min=min(roi_sizes),
                 max=max(roi_sizes),
                 avg=sum(roi_sizes) / len(roi_sizes),
+                sd=stride_dominant_count,
+                total=len(roi_sizes),
             )
 
-        # Setup output video
+        # Setup output path
         output_path = self.output_dir / f"{self.input_path.stem}_ID_{track_id}.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # type: ignore[attr-defined]
-        out = cv2.VideoWriter(
-            str(output_path),
-            fourcc,
-            self.fps,
-            (self.output_size, self.output_size),
-        )
+
+        # Collect frames first, then encode with FFmpeg for quality
+        collected_frames: list[np.ndarray] = []
+        frames_skipped = 0
 
         # Re-read video and extract crops with dynamic sizing
         cap = cv2.VideoCapture(str(self.input_path))
         frame_idx = 0
-        frames_written = 0
-
-        frames_skipped = 0
 
         try:
             while True:
@@ -802,13 +927,10 @@ class VideoPreprocessor:
                     crop = self.extract_crop_with_padding(frame, bounds, roi_size)
 
                     # Resize to output size (224x224)
-                    # Far runner (small roi): zoom in digitally
-                    # Close runner (large roi): zoom out
                     resized = cv2.resize(
                         crop, (self.output_size, self.output_size), interpolation=cv2.INTER_LINEAR
                     )
-                    out.write(resized)
-                    frames_written += 1
+                    collected_frames.append(resized)
 
                     # Optional visualization
                     if self.visualize:
@@ -818,7 +940,23 @@ class VideoPreprocessor:
 
         finally:
             cap.release()
-            out.release()
+
+        # Encode collected frames with FFmpeg (high quality)
+        frames_written = len(collected_frames)
+        if frames_written > 0:
+            success = self._encode_video_ffmpeg(collected_frames, output_path, self.fps)
+            if not success:
+                # Fallback to OpenCV if FFmpeg fails
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # type: ignore[attr-defined]
+                out = cv2.VideoWriter(
+                    str(output_path),
+                    fourcc,
+                    self.fps,
+                    (self.output_size, self.output_size),
+                )
+                for f in collected_frames:
+                    out.write(f)
+                out.release()
 
         if frames_skipped > 0:
             logger.debug(
@@ -964,7 +1102,6 @@ class VideoPreprocessor:
         base_name = video_path.stem  # e.g., "lap_006_ID_3"
 
         clips_generated = 0
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # type: ignore[attr-defined]
 
         for i in range(num_slices):
             # Calculate window boundaries
@@ -975,34 +1112,40 @@ class VideoPreprocessor:
             if end_frame > len(frames):
                 break
 
-            # Create output path: {base_name}_clip_{001}.mp4
             clip_name = f"{base_name}_clip_{i + 1:03d}.mp4"
             clip_path = clips_dir / clip_name
 
-            # Write clip - use exact source FPS and resolution
-            writer = cv2.VideoWriter(
-                str(clip_path),
-                fourcc,
-                fps,  # Exact FPS from source video
-                (width, height),  # Exact resolution (should be 224x224)
-            )
+            # Extract clip frames
+            clip_frames = frames[start_frame:end_frame]
 
-            # Write frames for this window
-            for frame_idx in range(start_frame, end_frame):
-                writer.write(frames[frame_idx])
+            # Encode with FFmpeg (high quality)
+            success = self._encode_video_ffmpeg(clip_frames, clip_path, fps)
+            if not success:
+                # Fallback to OpenCV if FFmpeg fails
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # type: ignore[attr-defined]
+                writer = cv2.VideoWriter(
+                    str(clip_path),
+                    fourcc,
+                    fps,
+                    (width, height),
+                )
+                for frame in clip_frames:
+                    writer.write(frame)
+                writer.release()
 
-            writer.release()
             clips_generated += 1
 
+        quality = "lossless" if self.video_crf == 0 else f"CRF {self.video_crf}"
         logger.debug(
             "Sliced track {id}: {n} clips from {total} frames "
-            "(slice_len={s}, stride={st}, overlap={o})",
+            "(slice_len={s}, stride={st}, overlap={o}, quality={q})",
             id=track_id,
             n=clips_generated,
             total=len(frames),
             s=self.slice_len,
             st=self.stride,
             o=self.slice_len - self.stride,
+            q=quality,
         )
 
         return clips_generated
@@ -1101,6 +1244,18 @@ def parse_args() -> argparse.Namespace:
         help="Minimum crop size to prevent uselessly small crops (default: 128)",
     )
     parser.add_argument(
+        "--foot-length-ratio",
+        type=float,
+        default=0.20,
+        help="Foot length as fraction of body height for stride calc (default: 0.15)",
+    )
+    parser.add_argument(
+        "--side-view-y-offset-ratio",
+        type=float,
+        default=0.1,
+        help="Additional downward shift for ground contact visibility (default: 0.1)",
+    )
+    parser.add_argument(
         "--ankle-vertical-ratio",
         type=float,
         default=0.35,
@@ -1152,14 +1307,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--slice-len",
         type=int,
-        default=32,
-        help="Number of frames per training clip (default: 32)",
+        default=16,
+        help="Number of frames per training clip (default: 16)",
     )
     parser.add_argument(
         "--stride",
         type=int,
         default=16,
         help="Sliding window stride between clips (default: 16, creates 50%% overlap)",
+    )
+    parser.add_argument(
+        "--video-crf",
+        type=int,
+        default=0,
+        help="H.264 CRF quality (0=lossless, 17=visually lossless, 23=default). Lower=better quality",
     )
 
     return parser.parse_args()
@@ -1185,6 +1346,8 @@ def main() -> None:
     config = PreprocessorConfig(
         roi_height_ratio=args.roi_height_ratio,
         min_roi_size=args.min_roi_size,
+        foot_length_ratio=args.foot_length_ratio,
+        side_view_y_offset_ratio=args.side_view_y_offset_ratio,
         ankle_vertical_ratio=args.ankle_vertical_ratio,
         max_padding_ratio=args.max_padding_ratio,
         output_size=args.output_size,
@@ -1195,6 +1358,7 @@ def main() -> None:
         visualize=args.visualize,
         slice_len=args.slice_len,
         stride=args.stride,
+        video_crf=args.video_crf,
     )
 
     try:
