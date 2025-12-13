@@ -61,10 +61,16 @@ uv run python -m rpa.batch_process \
     --input-dir /Users/nirgofman/Desktop/running-pattern/tagged_data_videos \
     --output-dir /Users/nirgofman/Desktop/running-pattern/training_clips
 
-
+z
   {camera_feature}_{lap_info}_CUT_{clip_num}_{label}.mp4
        │               │           │           │
        │               │           │           └── Original label (000, 001, etc.)
        │               │           └── Clip number from process_runners
        │               └── Lap identifier (lap_017)
        └── Camera/run identifier (15VR_RUN2_CAM2)
+
+
+ uv run python -m rpa.batch_process \
+    --input-dir /Users/nirgofman/Desktop/running-pattern/tagged_data_videos \
+    --output-dir /Users/nirgofman/Desktop/running-pattern/output_clips \
+    --workers 7

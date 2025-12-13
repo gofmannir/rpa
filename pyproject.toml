@@ -5,11 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "jupyter>=1.1.1",
     "lap>=0.5.12",
     "loguru>=0.7.3",
+    "matplotlib>=3.10.7",
     "mediapipe>=0.10.14",
     "numpy>=2.3.3",
     "opencv-python>=4.11.0.86",
+    "pandas>=2.3.3",
+    "pydantic>=2.12.5",
+    "seaborn>=0.13.2",
     "torch>=2.8.0",
     "transformers>=4.57.3",
     "ultralytics>=8.3.214",
