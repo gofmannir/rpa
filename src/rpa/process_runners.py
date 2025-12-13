@@ -54,6 +54,12 @@ CLI Options:
     --stride INT              Sliding window stride between clips (default: 16)
                               Creates 50% overlap with default settings
 
+    Runner Detection (filter out walkers/standers):
+    --no-runner-detection     Disable runner detection, keep all tracks
+    --min-ankle-variance FLOAT  Minimum ankle variance for running gait (default: 0=disabled)
+    --top-n-fastest INT       Keep only top N fastest tracks (default: 0=use ratio)
+    --min-speed-ratio FLOAT   Keep tracks with speed >= ratio * max_speed (default: 0.5)
+
     Debug:
     --visualize               Show real-time visualization during processing
 
@@ -90,6 +96,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 from loguru import logger
 from ultralytics import YOLO
 
@@ -109,6 +116,17 @@ class FrameData:
     right_ankle: tuple[float, float] | None
     confidence: float
     bbox_height: float  # Height of person's bounding box for dynamic ROI scaling
+
+
+@dataclass
+class MotionStats:
+    """Motion statistics for a tracked person to distinguish runners from walkers/standers."""
+
+    track_id: int
+    avg_speed: float  # Average movement speed in pixels/frame
+    ankle_variance: float  # Variance in ankle distance (high = running gait cycle)
+    vertical_oscillation: float  # Variance in vertical position (runners bounce more)
+    frame_count: int
 
 
 @dataclass
@@ -148,6 +166,13 @@ class PreprocessorConfig:
     # CRF (Constant Rate Factor) for H.264 encoding: 0=lossless, 17=visually lossless, 23=default
     # Lower = better quality, larger files. Recommended: 0-17 for training data
     video_crf: int = 0  # 0 = lossless H.264
+
+    # Runner detection settings
+    # Filter out stationary/walking people, keep only active runners
+    runner_detection: bool = True  # Enable runner vs walker/stander filtering
+    min_ankle_variance: float = 0.0  # Minimum ankle variance to be considered running gait (0=auto)
+    top_n_fastest: int = 0  # Keep only top N fastest tracks (0=keep all above threshold)
+    min_speed_ratio: float = 0.5  # Keep tracks with speed >= this ratio of max speed (0-1)
 
 
 class VideoPreprocessor:
@@ -212,17 +237,37 @@ class VideoPreprocessor:
         self.stride = self.config.stride
         self.video_crf = self.config.video_crf
 
+        # Runner detection config
+        self.runner_detection = self.config.runner_detection
+        self.min_ankle_variance = self.config.min_ankle_variance
+        self.top_n_fastest = self.config.top_n_fastest
+        self.min_speed_ratio = self.config.min_speed_ratio
+
         self.model: YOLO | None = None
         self.fps: int = 30
         self.frame_width: int = 0
         self.frame_height: int = 0
         self.total_frames: int = 0
 
+    def _detect_best_device(self) -> str:
+        """Detect the best available device for inference.
+
+        Returns:
+            Device string: 'mps' for Apple Silicon, 'cuda' for NVIDIA, 'cpu' otherwise
+        """
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
     def load_model(self) -> None:
         """Load YOLO v8 pose model for keypoint detection and tracking."""
-        logger.info("Loading YOLO v8 pose model...")
+        device = self._detect_best_device()
+        logger.info("Loading YOLO v8 pose model on {device}...", device=device)
         self.model = YOLO("yolov8n-pose.pt")
-        logger.info("Model loaded successfully")
+        self.model.to(device)
+        logger.info("Model loaded successfully on {device}", device=device)
 
     def _setup_video_capture(self) -> cv2.VideoCapture:
         """Setup video capture and store video properties.
@@ -384,6 +429,184 @@ class VideoPreprocessor:
             "Filtered {removed} ghost tracks, {kept} tracks remaining",
             removed=removed_count,
             kept=len(filtered),
+        )
+
+        return filtered
+
+    def calculate_motion_stats(
+        self, track_id: int, frame_data_list: list[FrameData]
+    ) -> MotionStats:
+        """Calculate motion statistics for a track to distinguish runners from walkers/standers.
+
+        Computes:
+        - avg_speed: Average movement speed (pixels/frame) - runners move faster
+        - ankle_variance: Variance in ankle distance - runners have cycling gait
+        - vertical_oscillation: Variance in vertical position - runners bounce more
+
+        Args:
+            track_id: Track identifier
+            frame_data_list: List of frame data for this track
+
+        Returns:
+            MotionStats with computed values
+        """
+        min_frames_for_stats = 2  # Need at least 2 frames to calculate speed
+        if len(frame_data_list) < min_frames_for_stats:
+            return MotionStats(
+                track_id=track_id,
+                avg_speed=0.0,
+                ankle_variance=0.0,
+                vertical_oscillation=0.0,
+                frame_count=len(frame_data_list),
+            )
+
+        # Collect positions and ankle distances
+        positions: list[tuple[float, float]] = []
+        ankle_distances: list[float] = []
+        y_positions: list[float] = []
+
+        for fd in frame_data_list:
+            # Calculate center position from ankles
+            if fd.left_ankle and fd.right_ankle:
+                cx = (fd.left_ankle[0] + fd.right_ankle[0]) / 2
+                cy = (fd.left_ankle[1] + fd.right_ankle[1]) / 2
+                positions.append((cx, cy))
+                y_positions.append(cy)
+
+                # Ankle spread (stride indicator) - horizontal distance between ankles
+                ankle_dist = abs(fd.left_ankle[0] - fd.right_ankle[0])
+                ankle_distances.append(ankle_dist)
+            elif fd.left_ankle:
+                positions.append(fd.left_ankle)
+                y_positions.append(fd.left_ankle[1])
+            elif fd.right_ankle:
+                positions.append(fd.right_ankle)
+                y_positions.append(fd.right_ankle[1])
+
+        # Calculate average speed (pixels/frame)
+        speeds: list[float] = []
+        for i in range(1, len(positions)):
+            dx = positions[i][0] - positions[i - 1][0]
+            dy = positions[i][1] - positions[i - 1][1]
+            speed = (dx**2 + dy**2) ** 0.5
+            speeds.append(speed)
+
+        avg_speed = float(np.mean(speeds)) if speeds else 0.0
+
+        # Calculate ankle distance variance (high = running gait cycle)
+        ankle_variance = float(np.var(ankle_distances)) if ankle_distances else 0.0
+
+        # Calculate vertical oscillation (runners bounce more)
+        vertical_oscillation = float(np.var(y_positions)) if y_positions else 0.0
+
+        return MotionStats(
+            track_id=track_id,
+            avg_speed=avg_speed,
+            ankle_variance=ankle_variance,
+            vertical_oscillation=vertical_oscillation,
+            frame_count=len(frame_data_list),
+        )
+
+    def filter_runners(
+        self, tracks: dict[int, list[FrameData]]
+    ) -> dict[int, list[FrameData]]:
+        """Filter tracks to keep only active runners based on motion analysis.
+
+        Uses two criteria:
+        1. Ankle variance - runners have high variance due to gait cycle
+        2. Speed - runners are the fastest moving tracks in the video
+
+        The filtering strategy:
+        - Calculate motion stats for all tracks
+        - If top_n_fastest > 0: keep only the N fastest tracks
+        - Otherwise: keep tracks with speed >= min_speed_ratio * max_speed
+        - Optionally filter by minimum ankle variance
+
+        Args:
+            tracks: Dictionary of track_id to FrameData list
+
+        Returns:
+            Filtered dictionary with only runner tracks
+        """
+        if not tracks:
+            return tracks
+
+        # Calculate motion stats for all tracks
+        all_stats: list[MotionStats] = []
+        for track_id, frame_data_list in tracks.items():
+            stats = self.calculate_motion_stats(track_id, frame_data_list)
+            all_stats.append(stats)
+
+        # Log stats for debugging
+        logger.info("Motion statistics for {n} tracks:", n=len(all_stats))
+        for stats in sorted(all_stats, key=lambda s: s.avg_speed, reverse=True):
+            logger.debug(
+                "  Track {id}: speed={speed:.2f} px/frame, ankle_var={avar:.2f}, "
+                "vert_osc={vosc:.2f}, frames={frames}",
+                id=stats.track_id,
+                speed=stats.avg_speed,
+                avar=stats.ankle_variance,
+                vosc=stats.vertical_oscillation,
+                frames=stats.frame_count,
+            )
+
+        # Find max speed for ratio-based filtering
+        max_speed = max(s.avg_speed for s in all_stats) if all_stats else 0.0
+
+        if max_speed == 0:
+            logger.warning("All tracks have zero speed - keeping all tracks")
+            return tracks
+
+        # Determine which tracks to keep
+        kept_track_ids: set[int] = set()
+
+        if self.top_n_fastest > 0:
+            # Keep top N fastest tracks
+            sorted_by_speed = sorted(all_stats, key=lambda s: s.avg_speed, reverse=True)
+            top_tracks = sorted_by_speed[: self.top_n_fastest]
+            kept_track_ids = {s.track_id for s in top_tracks}
+            logger.info(
+                "Keeping top {n} fastest tracks (speeds: {speeds})",
+                n=self.top_n_fastest,
+                speeds=[f"{s.avg_speed:.2f}" for s in top_tracks],
+            )
+        else:
+            # Keep tracks with speed >= min_speed_ratio * max_speed
+            speed_threshold = self.min_speed_ratio * max_speed
+            for stats in all_stats:
+                if stats.avg_speed >= speed_threshold:
+                    kept_track_ids.add(stats.track_id)
+
+            logger.info(
+                "Speed threshold: {thresh:.2f} px/frame ({ratio:.0%} of max {max:.2f})",
+                thresh=speed_threshold,
+                ratio=self.min_speed_ratio,
+                max=max_speed,
+            )
+
+        # Additionally filter by ankle variance if specified
+        if self.min_ankle_variance > 0:
+            before_count = len(kept_track_ids)
+            kept_track_ids = {
+                tid
+                for tid in kept_track_ids
+                if any(s.track_id == tid and s.ankle_variance >= self.min_ankle_variance for s in all_stats)
+            }
+            logger.info(
+                "Ankle variance filter (min={min:.2f}): {before} -> {after} tracks",
+                min=self.min_ankle_variance,
+                before=before_count,
+                after=len(kept_track_ids),
+            )
+
+        # Build filtered tracks dict
+        filtered = {tid: tracks[tid] for tid in kept_track_ids if tid in tracks}
+
+        removed_count = len(tracks) - len(filtered)
+        logger.info(
+            "Runner detection: kept {kept} runners, filtered {removed} non-runners",
+            kept=len(filtered),
+            removed=removed_count,
         )
 
         return filtered
@@ -1156,8 +1379,9 @@ class VideoPreprocessor:
         Pipeline Phases:
             1. Data Collection: Track all persons using YOLO pose
             2. Ghost Filtering: Remove short-lived tracks
-            3. Video Generation: Create stabilized feet crops per track
-            4. Temporal Slicing: Slice into fixed-length clips for VideoMAE
+            3. Runner Detection: Filter out walkers/standers, keep only runners
+            4. Video Generation: Create stabilized feet crops per track
+            5. Temporal Slicing: Slice into fixed-length clips for VideoMAE
         """
         # Phase 1: Collect tracking data
         tracks = self.collect_tracks()
@@ -1165,12 +1389,19 @@ class VideoPreprocessor:
         # Phase 2: Filter ghost tracks
         valid_tracks = self.filter_ghost_tracks(tracks)
 
-        # Phase 3: Generate stabilized output videos
+        # Phase 3: Runner detection - filter out walkers/standers
+        if self.runner_detection:
+            logger.info("Phase 3: Runner detection (filtering non-runners)...")
+            valid_tracks = self.filter_runners(valid_tracks)
+        else:
+            logger.info("Phase 3: Runner detection disabled, keeping all tracks")
+
+        # Phase 4: Generate stabilized output videos
         generated_videos = self.generate_output_videos(valid_tracks)
 
-        # Phase 4: Temporal slicing for VideoMAE Transformer
+        # Phase 5: Temporal slicing for VideoMAE Transformer
         logger.info(
-            "Phase 4: Slicing into {s}-frame clips with stride {st}...",
+            "Phase 5: Slicing into {s}-frame clips with stride {st}...",
             s=self.slice_len,
             st=self.stride,
         )
@@ -1323,6 +1554,31 @@ def parse_args() -> argparse.Namespace:
         help="H.264 CRF quality (0=lossless, 17=visually lossless, 23=default). Lower=better quality",
     )
 
+    # Runner detection arguments
+    parser.add_argument(
+        "--no-runner-detection",
+        action="store_true",
+        help="Disable runner detection (keep all tracks, including walkers/standers)",
+    )
+    parser.add_argument(
+        "--min-ankle-variance",
+        type=float,
+        default=0.0,
+        help="Minimum ankle variance to be considered running gait (default: 0=disabled)",
+    )
+    parser.add_argument(
+        "--top-n-fastest",
+        type=int,
+        default=0,
+        help="Keep only top N fastest tracks (default: 0=use speed ratio instead)",
+    )
+    parser.add_argument(
+        "--min-speed-ratio",
+        type=float,
+        default=0.5,
+        help="Keep tracks with speed >= this ratio of max speed (default: 0.5)",
+    )
+
     return parser.parse_args()
 
 
@@ -1359,6 +1615,11 @@ def main() -> None:
         slice_len=args.slice_len,
         stride=args.stride,
         video_crf=args.video_crf,
+        # Runner detection
+        runner_detection=not args.no_runner_detection,
+        min_ankle_variance=args.min_ankle_variance,
+        top_n_fastest=args.top_n_fastest,
+        min_speed_ratio=args.min_speed_ratio,
     )
 
     try:

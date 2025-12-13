@@ -9,5 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+output*
+
+*.pt
+
 .mypy_cache
 .ruff_cache
