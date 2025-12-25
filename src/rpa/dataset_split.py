@@ -24,6 +24,7 @@ from rpa.dataset_stats import DatasetStats, VideoMetadata, compute_dataset_stats
 RATIO_TOLERANCE = 0.001
 MIN_RUNNERS_FOR_VAL = 3
 MIN_RUNNERS_FOR_TWO_SPLITS = 2
+LABEL_REMAP_PARTS = 2  # Expected format: "old:new"
 
 
 class SplitConfig(BaseModel):
@@ -34,6 +35,7 @@ class SplitConfig(BaseModel):
     test_ratio: Annotated[float, Field(ge=0.0, le=1.0)] = 0.15
     seed: int = 42
     stratify_by_label: bool = True  # Try to balance labels across splits
+    label_remap: dict[int, int] = Field(default_factory=dict)  # e.g., {2: 0} to remap label 2 to 0
 
     def __post_init__(self) -> None:
         """Validate ratios sum to 1.0."""
@@ -86,22 +88,34 @@ class SplitResult:
         logger.info("Saved split to {path}", path=output_path)
 
 
-def _group_runners_by_label(stats: DatasetStats) -> dict[int, list[str]]:
+def _remap_label(label: int, remap: dict[int, int]) -> int:
+    """Apply label remapping if defined."""
+    return remap.get(label, label)
+
+
+def _group_runners_by_label(stats: DatasetStats, label_remap: dict[int, int] | None = None) -> dict[int, list[str]]:
     """Group runners by their primary label.
 
     Each runner should have only one label (their foot strike pattern).
     If a runner has multiple labels, use the most frequent one.
 
+    Args:
+        stats: Dataset statistics
+        label_remap: Optional dict to remap labels (e.g., {2: 0})
+
     Returns:
         Dict mapping label -> list of runner IDs
     """
+    remap = label_remap or {}
     label_to_runners: dict[int, list[str]] = defaultdict(list)
 
     for runner in stats.unique_runners:
         runner_labels = stats.label_by_runner[runner]
         # Get the dominant label for this runner
         primary_label = runner_labels.most_common(1)[0][0]
-        label_to_runners[primary_label].append(runner)
+        # Apply remapping
+        remapped_label = _remap_label(primary_label, remap)
+        label_to_runners[remapped_label].append(runner)
 
     return dict(label_to_runners)
 
@@ -160,7 +174,7 @@ def split_by_runner(
     random.seed(config.seed)
 
     # Group runners by their label for stratified splitting
-    label_to_runners = _group_runners_by_label(stats)
+    label_to_runners = _group_runners_by_label(stats, config.label_remap)
 
     train_runners: list[str] = []
     val_runners: list[str] = []
@@ -205,18 +219,19 @@ def split_by_runner(
     val_paths = [f for r in val_runners for f in runner_to_files[r]]
     test_paths = [f for r in test_runners for f in runner_to_files[r]]
 
-    # Compute label counts per split
-    def count_labels(paths: list[str], metadata: list[VideoMetadata]) -> dict[int, int]:
+    # Compute label counts per split (with remapping applied)
+    def count_labels(paths: list[str], metadata: list[VideoMetadata], remap: dict[int, int]) -> dict[int, int]:
         path_set = set(paths)
         counts: dict[int, int] = defaultdict(int)
         for m in metadata:
             if str(m.path) in path_set:
-                counts[m.label] += 1
+                remapped = _remap_label(m.label, remap)
+                counts[remapped] += 1
         return dict(counts)
 
-    train_labels = count_labels(train_paths, stats.metadata)
-    val_labels = count_labels(val_paths, stats.metadata)
-    test_labels = count_labels(test_paths, stats.metadata)
+    train_labels = count_labels(train_paths, stats.metadata, config.label_remap)
+    val_labels = count_labels(val_paths, stats.metadata, config.label_remap)
+    test_labels = count_labels(test_paths, stats.metadata, config.label_remap)
 
     return SplitResult(
         train_paths=sorted(train_paths),
@@ -296,6 +311,7 @@ class SplitParams:
     test_ratio: float = 0.15
     seed: int = 42
     stratify: bool = True
+    label_remap: dict[int, int] | None = None  # e.g., {2: 0} for binary classification
 
 
 def split_dataset(params: SplitParams) -> SplitResult:
@@ -326,6 +342,7 @@ def split_dataset(params: SplitParams) -> SplitResult:
         test_ratio=params.test_ratio,
         seed=params.seed,
         stratify_by_label=params.stratify,
+        label_remap=params.label_remap or {},
     )
 
     result = split_by_runner(stats, config)
@@ -382,6 +399,11 @@ def main() -> None:
         action="store_true",
         help="Disable label stratification",
     )
+    parser.add_argument(
+        "--remap-labels",
+        type=str,
+        help="Remap labels for binary classification, e.g., '2:0' to map label 2 to 0",
+    )
 
     args = parser.parse_args()
 
@@ -389,6 +411,21 @@ def main() -> None:
     total = args.train_ratio + args.val_ratio + args.test_ratio
     if abs(total - 1.0) > RATIO_TOLERANCE:
         parser.error(f"Ratios must sum to 1.0, got {total}")
+
+    # Parse label remapping (e.g., "2:0" or "2:0,3:1")
+    label_remap: dict[int, int] | None = None
+    if args.remap_labels:
+        label_remap = {}
+        for mapping in args.remap_labels.split(","):
+            parts = mapping.strip().split(":")
+            if len(parts) != LABEL_REMAP_PARTS:
+                parser.error(f"Invalid label mapping format: '{mapping}'. Expected 'old:new'")
+            try:
+                old_label, new_label = int(parts[0]), int(parts[1])
+                label_remap[old_label] = new_label
+            except ValueError:
+                parser.error(f"Invalid label values in '{mapping}'. Labels must be integers")
+        logger.info("Label remapping: {remap}", remap=label_remap)
 
     params = SplitParams(
         dataset_dir=args.input_dir,
@@ -398,6 +435,7 @@ def main() -> None:
         test_ratio=args.test_ratio,
         seed=args.seed,
         stratify=not args.no_stratify,
+        label_remap=label_remap,
     )
     split_dataset(params)
 
