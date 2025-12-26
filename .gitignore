@@ -15,3 +15,13 @@ output*
 
 .mypy_cache
 .ruff_cache
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/.terraform.lock.hcl
+terraform/terraform.tfvars
+
+# Trained models (large files)
+trained_model/
