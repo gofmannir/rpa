@@ -77,10 +77,10 @@ VM_ZONE=us-central1-a
 ssh-vm:
 	gcloud compute ssh $(VM_NAME) --zone=$(VM_ZONE)
 
-# Sync code to VM
+# Sync code to VM (via git push)
 .PHONY: sync-vm
 sync-vm:
-	gcloud compute scp --recurse --zone=$(VM_ZONE) src/rpa/ $(VM_NAME):~/rpa/src/rpa/
+	git push vm main --force
 
 # Augment local directory (for testing)
 .PHONY: augment-local
