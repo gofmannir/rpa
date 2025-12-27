@@ -1,6 +1,7 @@
 """Training script for VideoMAE fine-tuning on running pattern classification.
 
 Loads dataset splits from JSON file and trains a VideoMAE model for binary classification.
+Includes comprehensive augmentations to prevent overfitting and focus on foot patterns.
 
 Usage:
     uv run python -m rpa.train --split-json dataset_split.json --output-dir trained_model
@@ -8,13 +9,18 @@ Usage:
     # With custom hyperparameters
     uv run python -m rpa.train --split-json dataset_split.json --output-dir trained_model \
         --epochs 10 --batch-size 8 --lr 5e-5
+
+    # Disable augmentations (for ablation study)
+    uv run python -m rpa.train --split-json dataset_split.json --output-dir trained_model \
+        --no-augmentation
 """
 
 import argparse
 import json
+import random
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -40,6 +46,41 @@ LOG_INTERVAL = 10
 
 
 @dataclass
+class AugmentationConfig:
+    """Configuration for video augmentations.
+
+    All augmentations except grayscale are applied only during training.
+    Grayscale is always applied to prevent the model from learning color patterns.
+    """
+
+    # Always applied (train + val + test)
+    grayscale: bool = True
+
+    # Train-only augmentations
+    horizontal_flip_prob: float = 0.5
+    temporal_offset: bool = True  # Random start offset for temporal sampling
+
+    # Brightness and contrast (train only)
+    brightness_delta: float = 0.25  # ±25%
+    contrast_delta: float = 0.25  # ±25%
+
+    # Scale and crop (train only)
+    scale_range: tuple[float, float] = field(default_factory=lambda: (0.9, 1.1))
+
+    # Gaussian blur (train only)
+    blur_prob: float = 0.3
+    blur_sigma_max: float = 1.0
+
+    # Small rotation (train only)
+    rotation_prob: float = 0.3
+    rotation_degrees: float = 5.0
+
+    # Cutout / random erasing (train only)
+    cutout_prob: float = 0.3
+    cutout_ratio: float = 0.15  # Erase up to 15% of the area
+
+
+@dataclass
 class TrainConfig:
     """Training configuration."""
 
@@ -50,6 +91,8 @@ class TrainConfig:
     learning_rate: float = DEFAULT_LR
     num_workers: int = 0
     label_remap: dict[int, int] | None = None
+    augmentation: AugmentationConfig = field(default_factory=AugmentationConfig)
+    enable_augmentation: bool = True
 
 
 class VideoDataset(Dataset):
@@ -57,21 +100,28 @@ class VideoDataset(Dataset):
 
     Extracts labels from filenames using pattern: *_{label}.mp4
     Supports label remapping for binary classification.
+    Applies augmentations to training data.
     """
 
     def __init__(
         self,
         video_paths: list[str],
         label_remap: dict[int, int] | None = None,
+        is_train: bool = False,
+        augmentation: AugmentationConfig | None = None,
     ) -> None:
         """Initialize dataset.
 
         Args:
             video_paths: List of video file paths
             label_remap: Optional dict to remap labels (e.g., {2: 0})
+            is_train: Whether this is training data (enables augmentations)
+            augmentation: Augmentation configuration
         """
         self.video_paths = [Path(p) for p in video_paths]
         self.label_remap = label_remap or {}
+        self.is_train = is_train
+        self.augmentation = augmentation or AugmentationConfig()
         self.labels: list[int] = []
 
         # Extract labels from filenames
@@ -83,11 +133,14 @@ class VideoDataset(Dataset):
         self.idx_to_label = {idx: label for label, idx in self.label_to_idx.items()}
         self.num_classes = len(unique_labels)
 
+        mode = "train" if is_train else "eval"
         logger.info(
-            "Dataset: {n} videos, {c} classes, labels={labels}",
+            "Dataset ({mode}): {n} videos, {c} classes, labels={labels}, grayscale={gray}",
+            mode=mode,
             n=len(self.video_paths),
             c=self.num_classes,
             labels=unique_labels,
+            gray=self.augmentation.grayscale,
         )
 
     def _extract_labels(self) -> None:
@@ -106,15 +159,189 @@ class VideoDataset(Dataset):
                 logger.warning("Could not extract label from: {name}", name=path.name)
                 self.labels.append(0)  # Default fallback
 
-    def _load_video_frames(self, video_path: Path) -> np.ndarray | None:
-        """Load and preprocess video frames.
+    def _to_grayscale(self, frames: list[np.ndarray]) -> list[np.ndarray]:
+        """Convert RGB frames to grayscale (replicated to 3 channels for model compatibility).
 
         Args:
-            video_path: Path to video file
+            frames: List of RGB frames (H, W, 3)
 
         Returns:
-            Array of shape (NUM_FRAMES, FRAME_SIZE, FRAME_SIZE, 3) normalized
+            List of grayscale frames replicated to 3 channels (H, W, 3)
         """
+        grayscale_frames = []
+        for frame in frames:
+            # Convert to grayscale
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            # Replicate to 3 channels
+            gray_3ch = np.stack([gray, gray, gray], axis=-1)
+            grayscale_frames.append(gray_3ch)
+        return grayscale_frames
+
+    def _apply_horizontal_flip(self, frames: list[np.ndarray]) -> list[np.ndarray]:
+        """Apply horizontal flip to all frames consistently."""
+        return [cv2.flip(frame, 1) for frame in frames]
+
+    def _apply_brightness_contrast(self, frames: list[np.ndarray]) -> list[np.ndarray]:
+        """Apply random brightness and contrast adjustment to all frames consistently."""
+        cfg = self.augmentation
+
+        # Random brightness factor: 1 ± delta
+        brightness = 1.0 + random.uniform(-cfg.brightness_delta, cfg.brightness_delta)
+        # Random contrast factor: 1 ± delta
+        contrast = 1.0 + random.uniform(-cfg.contrast_delta, cfg.contrast_delta)
+
+        adjusted_frames = []
+        for frame in frames:
+            # Standard contrast/brightness formula centered at 128
+            frame_float = frame.astype(np.float32)
+            frame_adjusted = contrast * (frame_float - 128.0) + 128.0 + (brightness - 1.0) * 255.0
+            frame_adjusted = np.clip(frame_adjusted, 0, 255).astype(np.uint8)
+            adjusted_frames.append(frame_adjusted)
+
+        return adjusted_frames
+
+    def _apply_gaussian_blur(self, frames: list[np.ndarray]) -> list[np.ndarray]:
+        """Apply Gaussian blur to all frames consistently."""
+        cfg = self.augmentation
+        sigma = random.uniform(0.1, cfg.blur_sigma_max)
+        # Kernel size must be odd and at least MIN_BLUR_KERNEL
+        min_kernel = 3
+        kernel_size = max(int(2 * round(3 * sigma) + 1), min_kernel)
+
+        return [cv2.GaussianBlur(frame, (kernel_size, kernel_size), sigma) for frame in frames]
+
+    def _apply_rotation(self, frames: list[np.ndarray]) -> list[np.ndarray]:
+        """Apply small random rotation to all frames consistently."""
+        cfg = self.augmentation
+        angle = random.uniform(-cfg.rotation_degrees, cfg.rotation_degrees)
+
+        h, w = frames[0].shape[:2]
+        center = (w / 2, h / 2)
+        rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+        rotated_frames = []
+        for frame in frames:
+            rotated = cv2.warpAffine(
+                frame, rotation_matrix, (w, h), borderMode=cv2.BORDER_REFLECT_101
+            )
+            rotated_frames.append(rotated)
+
+        return rotated_frames
+
+    def _apply_scale_crop(self, frames: list[np.ndarray]) -> list[np.ndarray]:
+        """Apply random scale and crop to all frames consistently."""
+        cfg = self.augmentation
+        scale = random.uniform(cfg.scale_range[0], cfg.scale_range[1])
+
+        h, w = frames[0].shape[:2]
+        new_h, new_w = int(h * scale), int(w * scale)
+
+        # Calculate crop position
+        if new_h > h:
+            # Zoomed in: need to crop
+            top = random.randint(0, new_h - h)
+            left = random.randint(0, new_w - w)
+        else:
+            top, left = 0, 0
+
+        scaled_frames = []
+        for frame in frames:
+            # Scale
+            scaled = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            if new_h >= h and new_w >= w:
+                # Crop to original size
+                cropped = scaled[top : top + h, left : left + w]
+            else:
+                # Pad if scaled down (though scale_range typically >= 0.9)
+                cropped = cv2.resize(scaled, (w, h), interpolation=cv2.INTER_LINEAR)
+            scaled_frames.append(cropped)
+
+        return scaled_frames
+
+    def _apply_cutout(self, frames: list[np.ndarray]) -> list[np.ndarray]:
+        """Apply random cutout (erasing) to all frames at the same location."""
+        cfg = self.augmentation
+        h, w = frames[0].shape[:2]
+
+        # Calculate cutout size
+        cutout_h = int(h * np.sqrt(cfg.cutout_ratio))
+        cutout_w = int(w * np.sqrt(cfg.cutout_ratio))
+
+        # Random position
+        top = random.randint(0, h - cutout_h)
+        left = random.randint(0, w - cutout_w)
+
+        cutout_frames = []
+        for frame in frames:
+            frame_copy = frame.copy()
+            # Fill with mean gray value (128 for grayscale, or ImageNet mean for RGB)
+            frame_copy[top : top + cutout_h, left : left + cutout_w] = 128
+            cutout_frames.append(frame_copy)
+
+        return cutout_frames
+
+    def _temporal_sample_with_offset(self, frames: list[np.ndarray]) -> np.ndarray:
+        """Sample NUM_FRAMES with random temporal offset for training.
+
+        Strategy:
+        - If video > NUM_FRAMES: uniform sampling with random offset
+        - If video < NUM_FRAMES: loop/repeat frames
+        """
+        n_frames = len(frames)
+        cfg = self.augmentation
+
+        if n_frames == NUM_FRAMES:
+            return np.stack(frames)
+
+        if n_frames > NUM_FRAMES:
+            if self.is_train and cfg.temporal_offset:
+                # Random offset for training
+                max_offset = n_frames - NUM_FRAMES
+                offset = random.randint(0, max_offset)
+                # Sample NUM_FRAMES starting from offset
+                sample_indices = np.linspace(offset, offset + NUM_FRAMES - 1, NUM_FRAMES, dtype=int)
+                sample_indices = np.clip(sample_indices, 0, n_frames - 1)
+            else:
+                # Uniform sampling for validation/test
+                sample_indices = np.linspace(0, n_frames - 1, NUM_FRAMES, dtype=int)
+            return np.stack([frames[i] for i in sample_indices])
+
+        # Loop frames for short videos
+        loop_indices = [i % n_frames for i in range(NUM_FRAMES)]
+        return np.stack([frames[i] for i in loop_indices])
+
+    def _apply_train_augmentations(self, frames: list[np.ndarray]) -> list[np.ndarray]:
+        """Apply training-only augmentations to frames."""
+        cfg = self.augmentation
+
+        # Horizontal flip
+        if random.random() < cfg.horizontal_flip_prob:
+            frames = self._apply_horizontal_flip(frames)
+
+        # Brightness and contrast
+        if cfg.brightness_delta > 0 or cfg.contrast_delta > 0:
+            frames = self._apply_brightness_contrast(frames)
+
+        # Scale and crop
+        if cfg.scale_range != (1.0, 1.0):
+            frames = self._apply_scale_crop(frames)
+
+        # Gaussian blur
+        if random.random() < cfg.blur_prob:
+            frames = self._apply_gaussian_blur(frames)
+
+        # Small rotation
+        if random.random() < cfg.rotation_prob:
+            frames = self._apply_rotation(frames)
+
+        # Cutout
+        if random.random() < cfg.cutout_prob:
+            frames = self._apply_cutout(frames)
+
+        return frames
+
+    def _read_video_frames(self, video_path: Path) -> list[np.ndarray] | None:
+        """Read raw RGB frames from video file."""
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             logger.warning("Failed to open video: {path}", path=video_path)
@@ -126,11 +353,9 @@ class VideoDataset(Dataset):
                 ret, frame = cap.read()
                 if not ret:
                     break
+                # Convert BGR to RGB
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_resized = cv2.resize(
-                    frame_rgb, (FRAME_SIZE, FRAME_SIZE), interpolation=cv2.INTER_LINEAR
-                )
-                frames.append(frame_resized)
+                frames.append(frame_rgb)
         finally:
             cap.release()
 
@@ -138,8 +363,39 @@ class VideoDataset(Dataset):
             logger.warning("No frames extracted from: {path}", path=video_path)
             return None
 
-        # Temporal sampling
-        frames_array = self._temporal_sample(frames)
+        return frames
+
+    def _load_video_frames(self, video_path: Path) -> np.ndarray | None:
+        """Load and preprocess video frames with augmentations.
+
+        Args:
+            video_path: Path to video file
+
+        Returns:
+            Array of shape (NUM_FRAMES, FRAME_SIZE, FRAME_SIZE, 3) normalized
+        """
+        frames = self._read_video_frames(video_path)
+        if frames is None:
+            return None
+
+        cfg = self.augmentation
+
+        # Always apply grayscale (train + val + test)
+        if cfg.grayscale:
+            frames = self._to_grayscale(frames)
+
+        # Apply train-only augmentations
+        if self.is_train:
+            frames = self._apply_train_augmentations(frames)
+
+        # Resize all frames to target size
+        frames = [
+            cv2.resize(frame, (FRAME_SIZE, FRAME_SIZE), interpolation=cv2.INTER_LINEAR)
+            for frame in frames
+        ]
+
+        # Temporal sampling (with offset for training)
+        frames_array = self._temporal_sample_with_offset(frames)
 
         # Normalize
         frames_normalized = frames_array.astype(np.float32) / 255.0
@@ -147,27 +403,6 @@ class VideoDataset(Dataset):
 
         result: np.ndarray = frames_normalized.astype(np.float32)
         return result
-
-    def _temporal_sample(self, frames: list[np.ndarray]) -> np.ndarray:
-        """Sample exactly NUM_FRAMES from the video.
-
-        Strategy:
-        - If video > NUM_FRAMES: uniform sampling
-        - If video < NUM_FRAMES: loop/repeat frames
-        """
-        n_frames = len(frames)
-
-        if n_frames == NUM_FRAMES:
-            return np.stack(frames)
-
-        if n_frames > NUM_FRAMES:
-            # Uniform sampling
-            sample_indices = np.linspace(0, n_frames - 1, NUM_FRAMES, dtype=int)
-            return np.stack([frames[i] for i in sample_indices])
-
-        # Loop frames
-        loop_indices = [i % n_frames for i in range(NUM_FRAMES)]
-        return np.stack([frames[i] for i in loop_indices])
 
     def __len__(self) -> int:
         return len(self.video_paths)
@@ -212,12 +447,16 @@ def collate_fn(batch: list[dict]) -> dict[str, torch.Tensor | list[str]]:
 def load_split_data(
     split_json: Path,
     label_remap: dict[int, int] | None = None,
+    augmentation: AugmentationConfig | None = None,
+    enable_augmentation: bool = True,
 ) -> tuple[VideoDataset, VideoDataset, VideoDataset]:
     """Load train/val/test datasets from split JSON.
 
     Args:
         split_json: Path to dataset_split.json
         label_remap: Optional label remapping dict
+        augmentation: Augmentation configuration
+        enable_augmentation: Whether to enable train augmentations
 
     Returns:
         Tuple of (train_dataset, val_dataset, test_dataset)
@@ -236,9 +475,29 @@ def load_split_data(
         te=len(test_paths),
     )
 
-    train_dataset = VideoDataset(train_paths, label_remap)
-    val_dataset = VideoDataset(val_paths, label_remap)
-    test_dataset = VideoDataset(test_paths, label_remap)
+    aug_cfg = augmentation or AugmentationConfig()
+
+    # Training dataset with augmentations
+    train_dataset = VideoDataset(
+        train_paths,
+        label_remap,
+        is_train=enable_augmentation,  # Only enable train augmentations if flag is set
+        augmentation=aug_cfg,
+    )
+
+    # Validation and test datasets without train augmentations (but grayscale still applies)
+    val_dataset = VideoDataset(
+        val_paths,
+        label_remap,
+        is_train=False,
+        augmentation=aug_cfg,
+    )
+    test_dataset = VideoDataset(
+        test_paths,
+        label_remap,
+        is_train=False,
+        augmentation=aug_cfg,
+    )
 
     return train_dataset, val_dataset, test_dataset
 
@@ -386,7 +645,10 @@ def train(config: TrainConfig) -> None:
 
     # Load datasets
     train_dataset, val_dataset, test_dataset = load_split_data(
-        config.split_json, config.label_remap
+        config.split_json,
+        config.label_remap,
+        config.augmentation,
+        config.enable_augmentation,
     )
 
     # Create dataloaders
@@ -435,6 +697,8 @@ def train(config: TrainConfig) -> None:
     logger.info("Val samples: {n}", n=len(val_dataset))
     logger.info("Test samples: {n}", n=len(test_dataset))
     logger.info("Num classes: {n}", n=train_dataset.num_classes)
+    logger.info("Augmentation enabled: {aug}", aug=config.enable_augmentation)
+    logger.info("Grayscale: {gray}", gray=config.augmentation.grayscale)
     logger.info("=" * 60)
 
     best_val_accuracy = 0.0
@@ -535,6 +799,16 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help="Remap labels, e.g., '2:0' to map label 2 to 0",
     )
+    parser.add_argument(
+        "--no-augmentation",
+        action="store_true",
+        help="Disable training augmentations (grayscale still applied)",
+    )
+    parser.add_argument(
+        "--no-grayscale",
+        action="store_true",
+        help="Disable grayscale conversion (keep RGB)",
+    )
     return parser.parse_args()
 
 
@@ -557,6 +831,11 @@ def main() -> None:
                 label_remap[int(parts[0])] = int(parts[1])
         logger.info("Label remapping: {remap}", remap=label_remap)
 
+    # Build augmentation config
+    aug_config = AugmentationConfig(
+        grayscale=not args.no_grayscale,
+    )
+
     config = TrainConfig(
         split_json=args.split_json,
         output_dir=args.output_dir,
@@ -565,6 +844,8 @@ def main() -> None:
         learning_rate=args.lr,
         num_workers=args.num_workers,
         label_remap=label_remap,
+        augmentation=aug_config,
+        enable_augmentation=not args.no_augmentation,
     )
 
     train(config)

@@ -1,3 +1,7 @@
+# TODO: Add grayscale conversion to match training pipeline
+# Currently missing: convert frames to grayscale, replicate to 3 channels
+# This must match VideoDataset._to_grayscale() in train.py
+
 """Inference script for running predictions on video files using a trained VideoMAE model.
 
 Usage:
