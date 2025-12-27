@@ -559,8 +559,12 @@ def augment_single_video(
         # Apply augmentations
         augmented_frames = apply_augmentations(frames.copy(), params)
 
-        # Write output
-        output_name = f"{input_path.stem}_v{version:03d}.mp4"
+        # Write output - insert version before label (last segment after _)
+        parts = input_path.stem.rsplit("_", 1)
+        if len(parts) == 2:
+            output_name = f"{parts[0]}_v{version:03d}_{parts[1]}.mp4"
+        else:
+            output_name = f"{input_path.stem}_v{version:03d}.mp4"
         output_path = output_dir / output_name
 
         if write_video_frames(augmented_frames, output_path, fps):
@@ -774,8 +778,13 @@ def generate_augmented_dataset_json(
     # For training: include all augmented versions
     for path in original["train"]:
         video_stem = Path(path).stem
+        # Insert version before label (last segment after _)
+        parts = video_stem.rsplit("_", 1)
         for v in range(1, versions + 1):
-            aug_path = f"{augmented_prefix}{video_stem}_v{v:03d}.mp4"
+            if len(parts) == 2:
+                aug_path = f"{augmented_prefix}{parts[0]}_v{v:03d}_{parts[1]}.mp4"
+            else:
+                aug_path = f"{augmented_prefix}{video_stem}_v{v:03d}.mp4"
             new_split["train"].append(aug_path)
 
     # For val/test: only include grayscale version (v001 has minimal augmentation typically,
