@@ -84,12 +84,12 @@ class AugmentConfig:
 
     versions_per_video: int = 25
     # Probabilities for each augmentation type
-    flip_prob: float = 0.5
+    flip_prob: float = 0.7
     brightness_contrast_prob: float = 0.8
-    blur_prob: float = 0.3
-    rotation_prob: float = 0.4
+    blur_prob: float = 0.6
+    rotation_prob: float = 0.8
     scale_prob: float = 0.6
-    cutout_prob: float = 0.3
+    cutout_prob: float = 0.6
     # Augmentation parameters
     brightness_range: tuple[float, float] = field(default_factory=lambda: (-0.25, 0.25))
     contrast_range: tuple[float, float] = field(default_factory=lambda: (-0.25, 0.25))
