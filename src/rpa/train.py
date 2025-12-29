@@ -16,16 +16,19 @@ Usage:
 """
 
 import argparse
+import contextlib
 import json
 import random
 import re
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
+from google.cloud import storage  # type: ignore[import-untyped]
 from loguru import logger
 from torch.utils.data import DataLoader, Dataset
 from transformers import VideoMAEForVideoClassification
@@ -43,6 +46,61 @@ DEFAULT_EPOCHS = 10
 DEFAULT_BATCH_SIZE = 4
 DEFAULT_LR = 5e-5
 LOG_INTERVAL = 10
+
+# GCS constants
+MIN_GCS_URI_PARTS = 2  # bucket + path
+
+
+class GCSClientSingleton:
+    """Singleton wrapper for GCS client to avoid global statement."""
+
+    _instance: storage.Client | None = None
+
+    @classmethod
+    def get(cls) -> storage.Client:
+        """Get or create a GCS client."""
+        if cls._instance is None:
+            cls._instance = storage.Client()
+        return cls._instance
+
+
+def download_gcs_to_temp(gcs_uri: str) -> Path | None:
+    """Download a GCS file to a temporary local file.
+
+    Args:
+        gcs_uri: GCS URI (gs://bucket/path/to/file.mp4)
+
+    Returns:
+        Path to temporary file, or None if download failed
+    """
+    if not gcs_uri.startswith("gs://"):
+        return None
+
+    # Parse URI: gs://bucket/path/to/file.mp4
+    parts = gcs_uri[5:].split("/", 1)
+    if len(parts) < MIN_GCS_URI_PARTS:
+        logger.warning("Invalid GCS URI: {uri}", uri=gcs_uri)
+        return None
+
+    bucket_name = parts[0]
+    blob_path = parts[1]
+
+    try:
+        client = GCSClientSingleton.get()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_path)
+
+        # Download to temp file
+        suffix = Path(blob_path).suffix or ".mp4"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+
+        blob.download_to_filename(str(tmp_path))
+    except Exception as e:
+        logger.warning("Failed to download {uri}: {err}", uri=gcs_uri, err=e)
+        return None
+
+    return tmp_path
 
 
 @dataclass
@@ -113,12 +171,12 @@ class VideoDataset(Dataset):
         """Initialize dataset.
 
         Args:
-            video_paths: List of video file paths
+            video_paths: List of video file paths (local or gs:// URIs)
             label_remap: Optional dict to remap labels (e.g., {2: 0})
             is_train: Whether this is training data (enables augmentations)
             augmentation: Augmentation configuration
         """
-        self.video_paths = [Path(p) for p in video_paths]
+        self.video_paths = video_paths  # Keep as strings to support GCS URIs
         self.label_remap = label_remap or {}
         self.is_train = is_train
         self.augmentation = augmentation or AugmentationConfig()
@@ -149,14 +207,16 @@ class VideoDataset(Dataset):
         label_pattern = re.compile(r"_(\d+)\.mp4$")
 
         for path in self.video_paths:
-            match = label_pattern.search(path.name)
+            # Extract filename from path (works for both local and GCS paths)
+            filename = path.rstrip("/").split("/")[-1]
+            match = label_pattern.search(filename)
             if match:
                 label = int(match.group(1))
                 # Apply remapping
                 label = self.label_remap.get(label, label)
                 self.labels.append(label)
             else:
-                logger.warning("Could not extract label from: {name}", name=path.name)
+                logger.warning("Could not extract label from: {name}", name=filename)
                 self.labels.append(0)  # Default fallback
 
     def _to_grayscale(self, frames: list[np.ndarray]) -> list[np.ndarray]:
@@ -340,11 +400,11 @@ class VideoDataset(Dataset):
 
         return frames
 
-    def _read_video_frames(self, video_path: Path) -> list[np.ndarray] | None:
-        """Read raw RGB frames from video file."""
-        cap = cv2.VideoCapture(str(video_path))
+    def _read_local_video(self, local_path: Path) -> list[np.ndarray] | None:
+        """Read raw RGB frames from a local video file."""
+        cap = cv2.VideoCapture(str(local_path))
         if not cap.isOpened():
-            logger.warning("Failed to open video: {path}", path=video_path)
+            logger.warning("Failed to open video: {path}", path=local_path)
             return None
 
         frames: list[np.ndarray] = []
@@ -360,12 +420,35 @@ class VideoDataset(Dataset):
             cap.release()
 
         if not frames:
-            logger.warning("No frames extracted from: {path}", path=video_path)
+            logger.warning("No frames extracted from: {path}", path=local_path)
             return None
 
         return frames
 
-    def _load_video_frames(self, video_path: Path) -> np.ndarray | None:
+    def _read_video_frames(self, video_path: str) -> list[np.ndarray] | None:
+        """Read raw RGB frames from video file (local or GCS).
+
+        Args:
+            video_path: Local path or GCS URI (gs://bucket/path)
+
+        Returns:
+            List of RGB frames, or None if failed
+        """
+        if video_path.startswith("gs://"):
+            # Download from GCS to temp file
+            temp_path = download_gcs_to_temp(video_path)
+            if temp_path is None:
+                return None
+            try:
+                return self._read_local_video(temp_path)
+            finally:
+                # Clean up temp file
+                with contextlib.suppress(OSError):
+                    temp_path.unlink()
+        else:
+            return self._read_local_video(Path(video_path))
+
+    def _load_video_frames(self, video_path: str) -> np.ndarray | None:
         """Load and preprocess video frames with augmentations.
 
         Args:
@@ -424,10 +507,13 @@ class VideoDataset(Dataset):
         # Convert from (T, H, W, C) to (T, C, H, W) for VideoMAE
         frames_tensor: torch.Tensor = torch.from_numpy(frames).permute(0, 3, 1, 2)
 
+        # Extract filename from path (works for both local and GCS paths)
+        filename = video_path.rstrip("/").split("/")[-1]
+
         return {
             "pixel_values": frames_tensor,
             "label": label_idx,
-            "filename": video_path.name,
+            "filename": filename,
         }
 
 

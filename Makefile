@@ -90,3 +90,59 @@ augment-local:
 		--output /tmp/test_augmented/ \
 		--versions 5 \
 		--workers 2
+
+# Create GCS-aware split with augmented train data
+.PHONY: create-gcs-split
+create-gcs-split:
+	uv run python -m rpa.create_augmented_split \
+		--original-split dataset_split.json \
+		--bucket $(GCS_BUCKET) \
+		--output dataset_split_gcs.json \
+		--versions 25
+
+# Train on GCS data (augmented train, raw val/test)
+.PHONY: train-gcs
+train-gcs:
+	uv run python -m rpa.train \
+		--split-json dataset_split_gcs.json \
+		--output-dir trained_model_gcs \
+		--remap-labels 2:0 \
+		--epochs 10 \
+		--batch-size 8 \
+		--no-augmentation
+
+# File browser for GCS bucket (requires Docker)
+.PHONY: filestash
+filestash:
+	@echo "Starting Filestash file browser..."
+	@echo "Open http://localhost:8334 in your browser"
+	@echo "Bucket: $(GCS_BUCKET)"
+	docker run --rm -d \
+		-p 8334:8334 \
+		--name filestash \
+		-v $(HOME)/rpa-gcs-key.json:/app/data/state/config/gcs-key.json:ro \
+		-e APPLICATION_URL=http://localhost:8334 \
+		machines/filestash
+	@echo "Container started. Configure GCS backend in admin panel."
+
+.PHONY: filestash-stop
+filestash-stop:
+	docker stop filestash 2>/dev/null || true
+
+# Terraform targets for GCS service account
+.PHONY: tf-init
+tf-init:
+	cd terraform && terraform init
+
+.PHONY: tf-plan
+tf-plan:
+	cd terraform && terraform plan
+
+.PHONY: tf-apply
+tf-apply:
+	cd terraform && terraform apply
+	@echo "Service account key saved to: terraform/rpa-gcs-key.json"
+
+.PHONY: tf-destroy
+tf-destroy:
+	cd terraform && terraform destroy

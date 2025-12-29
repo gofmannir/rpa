@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "google-cloud-storage>=3.7.0",
     "jupyter>=1.1.1",
     "lap>=0.5.12",
     "loguru>=0.7.3",
