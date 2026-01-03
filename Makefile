@@ -82,6 +82,29 @@ ssh-vm:
 sync-vm:
 	git push vm main --force
 
+# Download trained model from VM
+.PHONY: download-model
+download-model:
+	gcloud compute scp --recurse \
+		$(VM_NAME):/home/nirgofman/rpa/trained_model_gcs/best_model \
+		./trained_model_gcs/best_model \
+		--zone=$(VM_ZONE)
+
+# Run inference on videos
+# Usage: make inference VIDEO=/path/to/video.mp4
+#        make inference VIDEO_DIR=/path/to/clips/
+MODEL_DIR=./trained_model_gcs/best_model
+.PHONY: inference
+inference:
+ifdef VIDEO_DIR
+	uv run python -m rpa.inference --model_dir $(MODEL_DIR) --video_dir $(VIDEO_DIR)
+else ifdef VIDEO
+	uv run python -m rpa.inference --model_dir $(MODEL_DIR) --video $(VIDEO)
+else
+	@echo "Usage: make inference VIDEO=/path/to/video.mp4"
+	@echo "       make inference VIDEO_DIR=/path/to/clips/"
+endif
+
 # Augment local directory (for testing)
 .PHONY: augment-local
 augment-local:

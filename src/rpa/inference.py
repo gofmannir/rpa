@@ -1,7 +1,3 @@
-# TODO: Add grayscale conversion to match training pipeline
-# Currently missing: convert frames to grayscale, replicate to 3 channels
-# This must match VideoDataset._to_grayscale() in train.py
-
 """Inference script for running predictions on video files using a trained VideoMAE model.
 
 Usage:
@@ -32,6 +28,15 @@ IMAGENET_STD = np.array([0.229, 0.224, 0.225])
 # VideoMAE requirements
 NUM_FRAMES = 16
 FRAME_SIZE = 224
+
+
+def to_grayscale(frame: np.ndarray) -> np.ndarray:
+    """Convert RGB frame to grayscale (replicated to 3 channels).
+
+    Matches the grayscale conversion used in training/augmentation pipeline.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    return np.stack([gray, gray, gray], axis=-1)
 
 
 def load_model(model_dir: Path) -> tuple[VideoMAEForVideoClassification, dict[int, int], torch.device]:
@@ -98,7 +103,9 @@ def load_video(video_path: Path) -> torch.Tensor | None:
             frame_resized = cv2.resize(
                 frame_rgb, (FRAME_SIZE, FRAME_SIZE), interpolation=cv2.INTER_LINEAR
             )
-            frames.append(frame_resized)
+            # Convert to grayscale (3-channel) to match training pipeline
+            frame_gray = to_grayscale(frame_resized)
+            frames.append(frame_gray)
     finally:
         cap.release()
 
