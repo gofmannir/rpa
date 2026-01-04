@@ -15,6 +15,50 @@ Raw Videos → Process & Clip → Dataset Split → Augmentation → Training �
      └── Tagged video files with labels
 ```
 
+---
+
+## Pipeline Visualization
+
+### 1. Raw Lap Video
+
+Full lap video captured from trackside camera (~30 seconds, 60fps). Below is a 3-second preview:
+
+![Raw Lap Video](docs/assets/raw_lap_example.gif)
+
+### 2. Extracted 16-Frame Clip
+
+The raw video is processed to detect and track runners, extracting stabilized foot crops as 16-frame clips (224x224):
+
+![16-Frame Clip Example](docs/assets/example_clip.gif)
+
+**Sampled frames from a single clip:**
+
+![Frames Grid](docs/assets/frames_grid.png)
+
+### 3. Data Augmentation
+
+Each training clip generates 25 augmented versions with random combinations of transformations:
+
+**Available Augmentations:**
+
+![Augmentations Grid](docs/assets/augmentations_grid.png)
+
+**Example: 9 Augmented Versions of the Same Clip:**
+
+![Versions Grid](docs/assets/versions_grid.png)
+
+| Augmentation | Probability | Parameters |
+|--------------|-------------|------------|
+| Grayscale | 100% | Always applied |
+| Horizontal Flip | 70% | Mirror left-right |
+| Brightness/Contrast | 80% | ±25% each |
+| Gaussian Blur | 60% | σ: 0.1-1.0 |
+| Rotation | 80% | -5° to +5° |
+| Scale/Crop | 60% | 0.9x - 1.1x |
+| Cutout | 60% | 15% area, upper half only |
+
+---
+
 ## Quick Start
 
 ```bash
