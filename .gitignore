@@ -25,3 +25,5 @@ terraform/terraform.tfvars
 
 # Trained models (large files)
 trained_model/
+
+.DS_Store
